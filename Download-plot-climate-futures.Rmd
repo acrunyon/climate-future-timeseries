@@ -1,0 +1,271 @@
+---
+title: "Climate Futures"
+author: "Amber Runyon"
+date: "3/23/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here); library(plyr); # Use here::here when package lubridate is used
+library(plotrix); library(zoo); library(ggplot2); library(grid); library(cowplot); library(reshape2); library(raster); library(ncdf4); library(reshape2); library(WriteXLS); library(data.table); library(RColorBrewer); library(ggrepel); library(lubridate); library(dplyr); library(gridExtra); library(tidyr); library(tibble); library(stringr); library(ggpubr); library(lemon)
+
+```
+
+## Climate Futures
+
+When trying to adapt to a changing climate, with all the inherent uncertainties about how the future may play out, resource managers often turn to scenario planning as a tool.  Managers use scenario planning to explore plausible ways the climate may change, allowing them to work with climate change uncertainty rather than being paralyzed by it.  Once identified, scenarios of the future are used to develop proactive measures to prepare for and adapt to scenarios of change.   A key part of scenario planning is generating a list of potential future climates we may experience. This script uses methods described in [Lawrence et al. (2020)](https://link.springer.com/epdf/10.1007/s10584-021-03169-y?sharing_token=MufjWsIQwncLzXdQ2awm9Pe4RwlQNchNByi7wbcMAY48-OL9-_d-75TukkQDtC_QgmuzZqcD52_phTlMsDeKUZ3hlN2p-e60d1ZHtYKyTYClg80yAvWfomsQIPT76_NhyeJSwspZWfdbrpOv4l1egfAD8shVTBGLvZL2_N5-GaQ%3D) and [Runyon et al. (2019)](https://escholarship.org/uc/item/76p7m8rz) to identify divergent, plausible climate futures for selected national parks.
+
+## Steps to run the code
+This code uses CMIP5 gloabal climate projections (2005-2099) downscaled by the MACA (Multivariate Adaptive Constructed Analogs) method (Abatzoglou and Brown 2012) with the METDATAv2 (Abatzoglou 2011) observational dataset as training data. (See <https://climate.northwestknowledge.net/MACA/MACAmethod.php> for details). The historical observational data used is GridMET, which is the training data used for the MACA downscaleing (Abatzoglou 2013, <https://climate.northwestknowledge.net/MACA/MACAtrainingdata.php>).
+
+To run this code, you must first enter the 4-letter code for the park unit you wish to plot (e.g., Rocky Mountain National Park is ROMO) and the location where you would like this data saved once it is downloaded. The following chunk of code will then download the historical and projected climate data from the MACA and GridMET datasets. The projected data is daily for 20 GCMs and 2 RCPs, so it may take a second. 
+
+
+```{r download-data, echo = FALSE, message=FALSE, warning=FALSE}
+SiteID = "ROMO" 
+DataDir = paste0('C:/Users/achildress/Documents/RCF_Testing/',SiteID)
+if(dir.exists(DataDir) == FALSE){
+  dir.create(DataDir)
+}
+# Read CSV files from WB project downloaded from:
+  #  https://parkfutures.s3.us-west-2.amazonaws.com/maca-tprh-data/index.html
+
+#################   Functions  ##################     
+checkFile <- function(fName, fileURL=F){
+  tmpFiles <- list.files(here::here(DataDir))
+  if(fName %in% tmpFiles){
+    print(paste(fName, " File exists. Not downloaded"))
+    if("zip" == tolower(str_sub(fName, str_length(fName)-2, str_length(fName))))unzip(paste(DataDir,fName,sep='/')) 
+    return(1)
+  }  # 1 file exists
+  # no file so go get it
+  print(paste("####  retrieving ", fName, " data file. Might take a while.  ######"))
+  options(timeout = 300)   # seconds. How long are you willing to wait?
+  getName <- paste("https://parkfutures.s3.us-west-2.amazonaws.com/maca-tprh-data/",fName, sep='')
+  
+  if(fileURL!=F)getName <- paste(fileURL, fName, sep='')
+  download.file(getName, destfile=paste(DataDir,fName,sep='/'), mode="wb")
+  # unzip if necessary
+  if("zip" == tolower(str_sub(fName, str_length(fName)-2, str_length(fName))))unzip(paste(DataDir,fName,sep='/'))
+}   # end checkFile
+
+
+TFtoC <- function(T){(T-32)/1.8}
+
+## Get Data
+
+histInFile <-  paste(SiteID,"_historical.csv", sep='')        # histInFile <- file.choose()    #  browse to path/file
+projInFile <- paste(SiteID,"_future.csv", sep='')
+checkFile(histInFile)
+Gridmet<- read.csv(paste(DataDir, histInFile, sep='/'))
+names(Gridmet) <- c("Date","GCM","PrcpIn","TmaxF","TminF","RHmaxPct","RHminPct","TavgF")
+Gridmet <- Gridmet %>% mutate(Year = year(Date),
+                              RCP = "Hist",
+                              DOY = yday(Date))   # for plotting
+
+checkFile(projInFile)
+Future_all <- read.csv(paste(DataDir, projInFile, sep="/"))
+Future_all$Year <- year(Future_all$Date)
+Future_all$RCP <- str_sub(Future_all$GCM, str_length(Future_all$GCM)-1, str_length(Future_all$GCM))
+
+names(Future_all) <- c("Date","GCM","PrcpIn","TmaxF","TminF","RHmaxPct","RHminPct","TavgF","Year", "RCP")
+
+Future_all <- Future_all %>% #dplyr::filter(GCM %in% wbGCMs) %>%
+  mutate(DOY = yday(Date))
+
+```
+
+## Select divergent climate futures
+
+Mid-century (2055) change values are calculated for each of the 40 projections (20 GCMs for 2 RCPs; 2040-2070 vs historical [1979-2012]) in the code below and the four projections that represent the most divergent climate futures are selected. Methods for this selection are outlined in Lawrence et al. (2020). 
+
+Note CCRP has produced an R package that conducts all of the following steps. It will be released in early-Summer 2022. 
+
+```{r climate future selection, echo=FALSE}
+## Select GCMs
+Gridmet$Date = strptime(Gridmet$Date, "%Y-%m-%d")
+Future_all$Date = strptime(Future_all$Date, "%Y-%m-%d")
+
+# # Subset Future_all to only be near future (2025-2055) and Baseline_all to only but until 2000
+Baseline_all<-Gridmet
+Baseline_all<-subset(Baseline_all,Year<2013)
+
+ALL_FUTURE<-Future_all  
+Future_all = subset(Future_all, Year >= 2040 & Year <= 2070)
+################################# SUMMARIZE CHANGE IN FUTURE TEMP/PRECIP MEANS BY GCM ####################
+####Set Average values for all four weather variables, using all baseline years and all climate models
+BaseMeanPr = mean(Baseline_all$PrcpIn)
+BaseMeanTmx = mean(Baseline_all$TmaxF)
+BaseMeanTmn = mean(Baseline_all$TminF)
+
+####Create Future/Baseline means data tables, with averages for all four weather variables, organized by GCM
+Future_Means = aggregate(cbind(PrcpIn, TmaxF, TminF, TavgF)
+                                    ~ GCM, Future_all, mean,na.rm=FALSE)   # , Future_all$Wind
+# names(Future_Means) = c("GCM", "PrcpIn", "TmaxF", "TminF", "TavgF")    # , "Wind"
+
+Baseline_Means = aggregate(cbind(PrcpIn, TmaxF, TminF, TavgF)~GCM, 
+                                      Baseline_all, mean)   
+# names(Baseline_Means) = c("GCM", "PrcpIn", "TmaxF", "TminF", "TavgF") 
+
+#### add delta columns in order to classify CFs
+Future_Means$DeltaPr = Future_Means$PrcpIn - Baseline_Means$PrcpIn
+Future_Means$DeltaTmx = Future_Means$TmaxF - Baseline_Means$TmaxF
+Future_Means$DeltaTmn = Future_Means$TminF - Baseline_Means$TminF
+Future_Means$DeltaTavg = Future_Means$TavgF - Baseline_Means$TavgF
+
+#### Set limits for CF classification
+Pr0 = as.numeric(quantile(Future_Means$DeltaPr, 0))
+Pr25 = as.numeric(quantile(Future_Means$DeltaPr, 0.25))
+PrAvg = as.numeric(mean(Future_Means$DeltaPr))
+Pr75 = as.numeric(quantile(Future_Means$DeltaPr, 0.75))
+Pr100 = as.numeric(quantile(Future_Means$DeltaPr, 1))
+Tavg0 = as.numeric(quantile(Future_Means$DeltaTavg, 0))
+Tavg25 = as.numeric(quantile(Future_Means$DeltaTavg, 0.25)) 
+Tavg = as.numeric(mean(Future_Means$DeltaTavg))
+Tavg75 = as.numeric(quantile(Future_Means$DeltaTavg, 0.75))
+Tavg100 = as.numeric(quantile(Future_Means$DeltaTavg, 1))
+
+#### Designate Climate Future
+Future_Means$CF1 = as.numeric((Future_Means$DeltaTavg<Tavg & Future_Means$DeltaPr>Pr75) | Future_Means$DeltaTavg<Tavg25 & Future_Means$DeltaPr>PrAvg)
+Future_Means$CF2 = as.numeric((Future_Means$DeltaTavg>Tavg & Future_Means$DeltaPr>Pr75) | Future_Means$DeltaTavg>Tavg75 & Future_Means$DeltaPr>PrAvg)
+Future_Means$CF3 = as.numeric((Future_Means$DeltaTavg>Tavg25 & Future_Means$DeltaTavg<Tavg75) & (Future_Means$DeltaPr>Pr25 & Future_Means$DeltaPr<Pr75))
+Future_Means$CF4 = as.numeric((Future_Means$DeltaTavg<Tavg & Future_Means$DeltaPr<Pr25) | Future_Means$DeltaTavg<Tavg25 & Future_Means$DeltaPr<PrAvg)
+Future_Means$CF5 = as.numeric((Future_Means$DeltaTavg>Tavg & Future_Means$DeltaPr<Pr25) | Future_Means$DeltaTavg>Tavg75 & Future_Means$DeltaPr<PrAvg)
+
+
+#Assign full name of climate future to new variable CF
+Future_Means$CF[Future_Means$CF1==1]="Warm Wet"
+Future_Means$CF[Future_Means$CF2==1]="Hot Wet"
+Future_Means$CF[Future_Means$CF3==1]="Central"
+Future_Means$CF[Future_Means$CF4==1]="Warm Dry"
+Future_Means$CF[Future_Means$CF5==1]="Hot Dry"
+
+#     Remove extraneous Climate Future columns
+Future_Means$CF1 = NULL
+Future_Means$CF2 = NULL
+Future_Means$CF3 = NULL
+Future_Means$CF4 = NULL
+Future_Means$CF5 = NULL
+
+#### Select Corner GCMs
+lx = min(Future_Means$DeltaTavg)
+ux = max(Future_Means$DeltaTavg)
+ly = min(Future_Means$DeltaPr)
+uy = max(Future_Means$DeltaPr)
+
+  #convert to points
+ww = c(lx,uy)
+wd = c(lx,ly)
+hw = c(ux,uy)
+hd = c(ux,ly)
+
+pts <- Future_Means
+
+  #calc Euclidian dist of each point from corners
+pts$WW.distance <- sqrt((pts$DeltaTavg - ww[1])^2 + (pts$DeltaPr - ww[2])^2)
+pts$WD.distance <- sqrt((pts$DeltaTavg - wd[1])^2 + (pts$DeltaPr - wd[2])^2)
+pts$HW.distance <- sqrt((pts$DeltaTavg - hw[1])^2 + (pts$DeltaPr - hw[2])^2)
+pts$HD.distance <- sqrt((pts$DeltaTavg - hd[1])^2 + (pts$DeltaPr - hd[2])^2)
+
+pts %>% filter(CF == "Warm Wet") %>% slice(which.min(WW.distance)) %>% .$GCM -> ww
+pts %>% filter(CF == "Warm Dry") %>% slice(which.min(WD.distance)) %>% .$GCM -> wd
+pts %>% filter(CF == "Hot Wet") %>% slice(which.min(HW.distance)) %>% .$GCM -> hw
+pts %>% filter(CF == "Hot Dry") %>% slice(which.min(HD.distance)) %>% .$GCM -> hd
+
+Future_Means %>% mutate(corners = ifelse(GCM == ww,"Warm Wet",
+                                         ifelse(GCM == wd, "Warm Dry",
+                                                ifelse(GCM == hw, "Hot Wet",
+                                                       ifelse( GCM == hd, "Hot Dry",NA))))) -> Future_Means
+```
+
+The four individual models selected as climate futures for "r SiteID" are:
+```{r four-cf-table, echo=FALSE}
+Climate.futures <- Future_Means %>% drop_na() %>% select(c(GCM,CF))
+knitr::kable(Climate.futures, format="markdown")
+```
+
+These models are plotted relative to the other models. 
+```{r scatterplot,echo=FALSE, warning=FALSE}
+
+dualscatter = ggplot(Future_Means, aes(DeltaTavg, DeltaPr*365, xmin=Tavg25, xmax=Tavg75, ymin=Pr25*365, ymax=Pr75*365))
+
+dualscatter  + geom_text_repel(aes(label=GCM)) +
+  geom_point(colour="black",size=4) +
+ geom_point(aes(x=DeltaTavg[which(corners=="Warm Wet")], y=365*DeltaPr[which(corners=="Warm Wet")]), shape=21, size=10, stroke=3, colour="cornflowerblue") +
+   geom_point(aes(x=DeltaTavg[which(corners=="Hot Dry")], y=365*DeltaPr[which(corners=="Hot Dry")]), shape=21, size=10, stroke=3, colour="red") +
+     geom_point(aes(x=DeltaTavg[which(corners=="Warm Dry")], y=365*DeltaPr[which(corners=="Warm Dry")]), shape=21, size=10, stroke=3, colour="gold1") +
+     geom_point(aes(x=DeltaTavg[which(corners=="Hot Wet")], y=365*DeltaPr[which(corners=="Hot Wet")]), shape=21, size=10, stroke=3, colour="green4") +
+
+  theme(axis.text=element_text(size=18),
+        axis.title.x=element_text(size=18,vjust=-0.2),
+        axis.title.y=element_text(size=18,vjust=0.2),
+        plot.title=element_text(size=18,face="bold",vjust=2,hjust=0.5),
+        legend.text=element_text(size=18), legend.title=element_text(size=16)) + 
+  ###
+  labs(title =paste(SiteID," Changes in climate means \n (2020-2099 vs 1979-2012) by GCM run",sep=""), 
+       x = "Changes in annual average temperature (\u00B0F)", # Change
+       y = "Changes in annual average precipitation (in)") + #change
+  scale_color_manual(name="Scenarios", values=c("black")) +
+  # scale_fill_manual(name="Scenarios",values = c("black")) + 
+  theme(legend.position="none") 
+  
+
+```
+
+
+Then annual temperature can be summarized for the cliamte futures. Here I have selected the "warm wet" and "hot dry" climate futures as these typically represent the "best" and "worst" case scenarios for park resources. 
+
+```{r plot annual temperature, echo=FALSE}
+degF <- "(\u00B0F)"
+
+## Plotting functions
+#ggplot theme to control formatting parameters for plots with month on the x-axis
+PlotTheme = theme(axis.text=element_text(size=20),    #Text size for axis tick mark labels
+                  axis.title.x=element_blank(),               #Text size and alignment for x-axis label
+                  axis.title.y=element_text(size=24, vjust=0.5,  margin=margin(t=20, r=20, b=20, l=20)),              #Text size and alignment for y-axis label
+                  plot.title=element_text(size=26,face="bold",hjust=0.5, margin=margin(t=20, r=20, b=20, l=20)),      #Text size and alignment for plot title
+                  legend.title=element_text(size=24),                                                                    #Text size of legend category labels
+                  legend.text=element_text(size=22),                                                                   #Text size of legend title
+                  legend.position = "bottom")  
+
+LT_plot <-function(data,yvar, rollvar,cols,yaxis,title){
+  ggplot(data, aes(x=Year, y={{yvar}}, col=CF, fill=CF)) + 
+    geom_rect(xmin=Yr-Range/2, xmax=Yr+Range/2, ymin=0, ymax=80, alpha=0.1, fill="lightgray", col="lightgray") +
+    # geom_ribbon(aes(x=as.numeric(as.character(year)), ymin=Tavg.min, ymax=Tavg.max, fill=CF), alpha=0.5) +
+    geom_line(size=2) + geom_point(col="black", size=2, shape=16) +
+    geom_point() +
+    geom_line(aes(x=Year, y={{rollvar}}),size=1.25,colour="black", na.rm=TRUE) +
+    geom_line(aes(x=Year, y={{rollvar}},colour = CF), size=.75 ,na.rm=TRUE) +
+    scale_x_continuous(breaks=c(1980, 2000, 2020, 2040, 2060, 2080, 2100)) +
+    labs(x="Year", y=yaxis,title=title) +
+    scale_color_manual(name="Climate Future",values=cols) +
+    scale_fill_manual(name="Climate Future",values=cols) + PlotTheme +
+    theme( axis.line = element_line(colour = "black"), #Add axis lines
+           panel.background = element_blank(), #Background white
+           panel.grid.major = element_line("light grey",0.3)) #add grid back)
+}
+
+## Format and summarize data
+Future_summary <- ALL_FUTURE %>% left_join(Climate.futures,by="GCM")
+Baseline_summary <- Gridmet; Baseline_summary$CF = "Historical"
+all_summary <- rbind(Baseline_summary, Future_summary)
+all_summary <- subset(all_summary, GCM %in% WB_GCMs$GCM | GCM == "gridmet.historical")
+all_summary$CF <- factor(all_summary$CF, levels=c("Historical", CFs))
+
+yrAvgs <- aggregate(cbind(TavgF, PrcpIn)~Year+CF,all_summary,mean)
+yrAvgs$PrcpIn <- yrAvgs$PrcpIn * 365
+yrAvgs$TavgRoll10 <- rollmean(yrAvgs$TavgF, rollLen, fill = NA, align = "right")
+yrAvgs$PrcpRoll10 <- rollmean(yrAvgs$Prcp, rollLen, fill = NA, align = "right")
+
+## Plots
+  # tmean
+t<-LT_plot(yrAvgs,TavgF,rollvar=TavgRoll10,cols=col,yaxis="Mean annual temperature (\u00B0F)",title="") 
+ggsave("LT-TavgF.png",t, path = FigDir, height=PlotHeight, width=PlotWidth)
+
+  # Precip
+p<-LT_plot(yrAvgs,PrcpIn,rollvar=PrcpRoll10,cols=col,yaxis="Mean annual precipitation (inches/Yr)",title="")
+ggsave("LT-PrcpIn.png", p, path = FigDir, height=PlotHeight, width=PlotWidth)
+
+```
